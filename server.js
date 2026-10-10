@@ -5,25 +5,16 @@ const crypto = require("crypto");
 const PORT = process.env.PORT || 10000;
 const MAX_USERS = 9;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
-const OFFICIAL_ROOM = "ROKO_OFFICIAL";
+const OFFICIAL_ROOM = "IMK_OFFICIAL";
 
 const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("Ro_ko Voice Chat server is running");
+    res.end("IMK Voice Chat server is running");
 });
 
 const wss = new WebSocket.Server({ server });
 const rooms = new Map();
 let nextId = 1;
-
-// Official Room हमेशा मौजूद रहेगा।
-rooms.set(OFFICIAL_ROOM, {
-    users: [],
-    hostId: null,
-    official: true,
-    requests: new Set(),
-    speakers: new Set()
-});
 
 function send(ws, data) {
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -31,22 +22,29 @@ function send(ws, data) {
     }
 }
 
-function broadcast(room, data, except = null) {
+function broadcast(room, data) {
     if (!room) return;
     for (const user of room.users) {
-        if (user.ws !== except) send(user.ws, data);
+        send(user.ws, data);
     }
 }
 
+function createRoom(roomId) {
+    return {
+        id: roomId,
+        users: [],
+        hostId: null,
+        official: roomId === OFFICIAL_ROOM,
+        requests: new Set(),
+        speakers: new Set()
+    };
+}
+
+rooms.set(OFFICIAL_ROOM, createRoom(OFFICIAL_ROOM));
+
 function getRoom(roomId) {
     if (!rooms.has(roomId)) {
-        rooms.set(roomId, {
-            users: [],
-            hostId: null,
-            official: false,
-            requests: new Set(),
-            speakers: new Set()
-        });
+        rooms.set(roomId, createRoom(roomId));
     }
     return rooms.get(roomId);
 }
@@ -58,7 +56,8 @@ function findUser(room, id) {
 function safeEqual(a, b) {
     const x = Buffer.from(String(a || ""));
     const y = Buffer.from(String(b || ""));
-    return x.length === y.length && crypto.timingSafeEqual(x, y);
+    return x.length === y.length &&
+        crypto.timingSafeEqual(x, y);
 }
 
 function isAdmin(ws) {
@@ -66,62 +65,24 @@ function isAdmin(ws) {
 }
 
 function canManageMic(ws, room) {
-    return isAdmin(ws) || room.hostId === ws.id;
+    if (isAdmin(ws)) return true;
+
+    return room.official &&
+        room.hostId === ws.id &&
+        room.users.some(user => user.id === ws.id);
 }
 
 function sendUsers(room) {
-    return room.users.map(user => ({
-        id: user.id,
-        name: user.name,
-        role: user.role,
-        canSpeak: room.speakers.has(user.id)
-    }));
-}
-
-function setMicPermission(room, target, allowed) {
-    if (!target) return;
-
-    if (allowed) {
-        room.speakers.add(target.id);
-    } else {
-        room.speakers.delete(target.id);
-    }
-
-    room.requests.delete(target.id);
-
-    send(target.ws, {
-        type: "mic_permission",
-        allowed: allowed
-    });
-
     broadcast(room, {
-        type: "speaker_changed",
-        id: target.id,
-        canSpeak: allowed
+        type: "users",
+        hostId: room.hostId,
+        users: room.users.map(user => ({
+            id: user.id,
+            name: user.name,
+            role: user.role,
+            canSpeak: room.speakers.has(user.id)
+        }))
     });
-}
-
-function notifyMicRequest(room, requester) {
-    let sent = false;
-
-    for (const user of room.users) {
-        if (canManageMic(user.ws, room) &&
-            user.id !== requester.id) {
-            send(user.ws, {
-                type: "mic_request_received",
-                id: requester.id,
-                name: requester.name
-            });
-            sent = true;
-        }
-    }
-
-    if (!sent) {
-        send(requester.ws, {
-            type: "message",
-            text: "Host/Admin अभी ऑनलाइन नहीं है।"
-        });
-    }
 }
 
 wss.on("connection", ws => {
@@ -137,46 +98,54 @@ wss.on("connection", ws => {
         try {
             data = JSON.parse(raw.toString());
         } catch (_) {
-            send(ws, {
-                type: "message",
-                text: "Invalid message"
-            });
             return;
         }
 
-        // Admin login
         if (data.type === "admin_login") {
             if (!ADMIN_PASSWORD) {
                 send(ws, {
                     type: "admin_login_result",
                     ok: false,
-                    text: "ADMIN_PASSWORD Render में सेट नहीं है"
+                    text: "Server पर ADMIN_PASSWORD सेट नहीं है"
                 });
                 return;
             }
 
             if (safeEqual(data.password, ADMIN_PASSWORD)) {
                 ws.isAdmin = true;
+
                 send(ws, {
                     type: "admin_login_result",
                     ok: true,
-                    text: "Admin verified"
+                    text: "Admin Login सफल"
                 });
             } else {
                 send(ws, {
                     type: "admin_login_result",
                     ok: false,
-                    text: "गलत Admin password"
+                    text: "Admin Password गलत है"
                 });
             }
+
             return;
         }
 
-        // Join room
         if (data.type === "join") {
-            if (ws.room) return;
+            if (ws.room) {
+                send(ws, {
+                    type: "message",
+                    text: "आप पहले से एक रूम में जुड़े हैं"
+                });
+                return;
+            }
 
-            const roomId = String(data.room || "").trim();
+            let roomId = String(data.room || "").trim();
+
+            // पुराने ऐप को नए आधिकारिक रूम पर भेजें।
+            if (roomId.toUpperCase() === "ROKO_OFFICIAL") {
+                roomId = OFFICIAL_ROOM;
+            }
+
             const name = String(data.name || "User")
                 .trim()
                 .slice(0, 40);
@@ -184,7 +153,7 @@ wss.on("connection", ws => {
             if (!roomId || !name) {
                 send(ws, {
                     type: "message",
-                    text: "Room ID और नाम डालें"
+                    text: "नाम और Room ID डालें"
                 });
                 return;
             }
@@ -194,7 +163,7 @@ wss.on("connection", ws => {
             if (room.users.length >= MAX_USERS) {
                 send(ws, {
                     type: "room_full",
-                    text: "Room full - 9 users maximum"
+                    text: "रूम भर चुका है — अधिकतम 9 लोग"
                 });
                 return;
             }
@@ -205,15 +174,23 @@ wss.on("connection", ws => {
             if (room.official) {
                 if (isAdmin(ws)) {
                     ws.role = "admin";
-                    room.hostId = ws.id;
+
+                    // यदि होस्ट तय नहीं है, तो Admin होस्ट बनेगा।
+                    if (!room.hostId) {
+                        room.hostId = ws.id;
+                    }
+                } else if (room.hostId === ws.id) {
+                    ws.role = "host";
                 } else {
                     ws.role = "user";
                 }
             } else if (room.users.length === 0) {
                 ws.role = "host";
                 room.hostId = ws.id;
+                room.speakers.add(ws.id);
             } else {
                 ws.role = "user";
+                room.speakers.add(ws.id);
             }
 
             room.users.push({
@@ -230,7 +207,12 @@ wss.on("connection", ws => {
                 hostId: room.hostId,
                 official: room.official,
                 canSpeak: room.speakers.has(ws.id),
-                users: sendUsers(room)
+                users: room.users.map(user => ({
+                    id: user.id,
+                    name: user.name,
+                    role: user.role,
+                    canSpeak: room.speakers.has(user.id)
+                }))
             });
 
             broadcast(room, {
@@ -239,7 +221,7 @@ wss.on("connection", ws => {
                 name: ws.name,
                 role: ws.role,
                 canSpeak: room.speakers.has(ws.id)
-            }, ws);
+            });
 
             return;
         }
@@ -249,9 +231,9 @@ wss.on("connection", ws => {
         const room = rooms.get(ws.room);
         if (!room) return;
 
-        // Ask for speaking permission
         if (data.type === "mic_request") {
-            if (room.speakers.has(ws.id)) {
+            if (!room.official) {
+                room.speakers.add(ws.id);
                 send(ws, {
                     type: "mic_permission",
                     allowed: true
@@ -260,67 +242,112 @@ wss.on("connection", ws => {
             }
 
             room.requests.add(ws.id);
-            notifyMicRequest(room, {
-                id: ws.id,
-                name: ws.name,
-                ws
+
+            const managers = room.users.filter(user =>
+                canManageMic(user.ws, room)
+            );
+
+            if (managers.length === 0) {
+                send(ws, {
+                    type: "message",
+                    text: "होस्ट/एडमिन ऑनलाइन नहीं है"
+                });
+                return;
+            }
+
+            for (const manager of managers) {
+                send(manager.ws, {
+                    type: "mic_request_received",
+                    id: ws.id,
+                    name: ws.name
+                });
+            }
+
+            send(ws, {
+                type: "message",
+                text: "माइक अनुमति का अनुरोध भेज दिया गया"
             });
+
             return;
         }
 
-        // Host/Admin grants or revokes mic permission
         if (data.type === "mic_permission_set") {
             if (!canManageMic(ws, room)) {
                 send(ws, {
                     type: "message",
-                    text: "Host/Admin permission required"
+                    text: "Admin या Official Host की अनुमति ज़रूरी है"
                 });
                 return;
             }
 
-            const target = findUser(room, data.target);
+            const targetId = String(data.target || "");
+            const target = findUser(room, targetId);
+
             if (!target) return;
 
-            setMicPermission(
-                room,
-                target,
-                data.allowed === true
-            );
+            const allowed = data.allowed === true;
+
+            if (allowed) {
+                room.speakers.add(targetId);
+            } else {
+                room.speakers.delete(targetId);
+                room.requests.delete(targetId);
+            }
+
+            if (allowed) {
+                room.requests.delete(targetId);
+            }
+
+            send(target.ws, {
+                type: "mic_permission",
+                allowed
+            });
+
+            broadcast(room, {
+                type: "speaker_changed",
+                id: targetId,
+                canSpeak: allowed
+            });
+
             return;
         }
 
-        // Admin may assign a new Official Room host.
         if (data.type === "set_official_host") {
-            if (!room.official || !isAdmin(ws)) {
+            if (!isAdmin(ws) || !room.official) {
                 send(ws, {
                     type: "message",
-                    text: "Only Admin can assign Official Room Host"
+                    text: "यह काम केवल Official Room Admin कर सकता है"
                 });
                 return;
             }
 
-            const target = findUser(room, data.target);
-            if (!target || isAdmin(target.ws)) return;
+            const targetId = String(data.target || "");
+            const target = findUser(room, targetId);
 
-            const oldHost = findUser(room, room.hostId);
-            if (oldHost && !isAdmin(oldHost.ws)) {
-                oldHost.role = "user";
+            if (!target) return;
+
+            room.hostId = targetId;
+
+            for (const user of room.users) {
+                if (user.role === "host") user.role = "user";
             }
 
-            room.hostId = target.id;
             target.role = "host";
 
             broadcast(room, {
                 type: "host_changed",
                 hostId: room.hostId
             });
+
+            sendUsers(room);
             return;
         }
 
-        // WebRTC signaling
-        if (data.type === "offer" ||
+        if (
+            data.type === "offer" ||
             data.type === "answer" ||
-            data.type === "candidate") {
+            data.type === "candidate"
+        ) {
             const target = findUser(room, data.target);
             if (!target) return;
 
@@ -336,6 +363,7 @@ wss.on("connection", ws => {
 
         const roomId = ws.room;
         const room = rooms.get(roomId);
+
         if (!room) return;
 
         const leavingId = ws.id;
@@ -353,21 +381,25 @@ wss.on("connection", ws => {
             id: leavingId
         });
 
-        if (wasHost) {
+        if (wasHost && room.official) {
             room.hostId = null;
 
-            if (room.official) {
-                const admin = room.users.find(
-                    user => isAdmin(user.ws)
-                );
+            // Admin ऑनलाइन हो तो उसे होस्ट बनाया जा सकता है।
+            const admin = room.users.find(user =>
+                isAdmin(user.ws)
+            );
 
-                if (admin) {
-                    room.hostId = admin.id;
-                }
-            } else if (room.users.length > 0) {
-                room.hostId = room.users[0].id;
-                room.users[0].role = "host";
+            if (admin) {
+                room.hostId = admin.id;
+                admin.role = "admin";
             }
+        } else if (
+            wasHost &&
+            !room.official &&
+            room.users.length > 0
+        ) {
+            room.hostId = room.users[0].id;
+            room.users[0].role = "host";
 
             broadcast(room, {
                 type: "host_changed",
@@ -375,16 +407,14 @@ wss.on("connection", ws => {
             });
         }
 
-        // Private rooms disappear when empty.
-        // Official Room remains available.
         if (room.users.length === 0 && !room.official) {
             rooms.delete(roomId);
+        } else {
+            sendUsers(room);
         }
     });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-    console.log(
-        "Ro_ko Voice Chat server started on port " + PORT
-    );
+    console.log("IMK Voice Chat server started on port " + PORT);
 });
