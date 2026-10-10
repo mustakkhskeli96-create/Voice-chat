@@ -174,7 +174,7 @@ wss.on("connection", ws => {
             if (room.official) {
                 if (isAdmin(ws)) {
                     ws.role = "admin";
-
+                     room.speakers.add(ws.id);
                     // यदि होस्ट तय नहीं है, तो Admin होस्ट बनेगा।
                     if (!room.hostId) {
                         room.hostId = ws.id;
